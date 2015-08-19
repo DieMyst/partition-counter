@@ -1,5 +1,3 @@
-import sbt._
-
 name := "partition-counter"
 
 version := "1.0"

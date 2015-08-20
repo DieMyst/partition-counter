@@ -16,8 +16,6 @@ import akka.util.{ByteString, Timeout}
 import spray.json.DefaultJsonProtocol
 
 import scala.concurrent.Future
-
-//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 
 /**
@@ -25,7 +23,6 @@ import scala.concurrent.duration._
  * Date: 18.08.2015
  * Time: 21:33
  */
-
 case class TopicsList(topics: List[String])
 case class LastTimestamp(timestamp: String)
 case class LastTimestampStats(sum: Long, min: Long, max: Long, average: Long)
@@ -48,12 +45,12 @@ class HttpFrontend(dir: String)(implicit system: ActorSystem) {
   import Protocols._
   import akka.http.scaladsl.model.MediaTypes._
 
+  import scala.concurrent.ExecutionContext.Implicits.global
+
   implicit val materializer = ActorMaterializer()
   implicit val timeout = Timeout(60.seconds)
 
   assert(new File(dir).exists())
-
-  import scala.concurrent.ExecutionContext.Implicits.global
 
   val cacheActor = system.actorOf(CacheTimestampActor.props)
 

@@ -14,6 +14,7 @@ import scala.concurrent.Future
  * Time: 20:49
  * Кэш, если вдруг огромное количество файлов. Можно такое же сделать для min, max, average
  * Еще идея была сделать мониторинг папки на WatchService, инфу обновлять походу, а на запросы всё из кэша доставать
+ * (например из БД, если всего много)
  */
 class CacheTimestampActor(var cachedDirs: Map[String, (String, Long)]) extends Actor with ActorLogging {
   implicit val exContext = context.dispatcher

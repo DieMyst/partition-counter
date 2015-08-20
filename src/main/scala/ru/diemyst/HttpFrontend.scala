@@ -8,16 +8,17 @@ import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
+import akka.pattern.ask
 import akka.stream.ActorMaterializer
 import akka.stream.io.{Framing, SynchronousFileSource}
 import akka.stream.scaladsl._
 import akka.util.{ByteString, Timeout}
-import com.typesafe.config.ConfigFactory
 import spray.json.DefaultJsonProtocol
 
-import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
+
+//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
-import scala.io.Source
 
 /**
  * User: diemust
@@ -29,6 +30,7 @@ case class TopicsList(topics: List[String])
 case class LastTimestamp(timestamp: String)
 case class LastTimestampStats(sum: Long, min: Long, max: Long, average: Long)
 case class LastRunPartitionList(partList: List[(String, String)])
+case class Error(error: String)
 
 case class FoldResult(min: Long, max: Long, sum: Long, count: Int) {
   def toStats: LastTimestampStats = LastTimestampStats(count, min, max, sum/count)
@@ -39,6 +41,7 @@ object Protocols extends DefaultJsonProtocol with SprayJsonSupport {
   implicit def lastTimestampFormat = jsonFormat1(LastTimestamp.apply)
   implicit def lastTimestampStatsFormat = jsonFormat4(LastTimestampStats.apply)
   implicit def lastRunPartitionListFormat = jsonFormat1(LastRunPartitionList.apply)
+  implicit def errorFormat = jsonFormat1(Error.apply)
 }
 
 class HttpFrontend(dir: String)(implicit system: ActorSystem) {
@@ -48,99 +51,95 @@ class HttpFrontend(dir: String)(implicit system: ActorSystem) {
   implicit val materializer = ActorMaterializer()
   implicit val timeout = Timeout(60.seconds)
 
+  assert(new File(dir).exists())
+
+  import scala.concurrent.ExecutionContext.Implicits.global
+
+  val cacheActor = system.actorOf(CacheTimestampActor.props)
+
   val log = Logging(system, classOf[HttpFrontend])
 
   val host = "127.0.0.1"
   val port = 8080
+
+  val framing = Framing.delimiter(ByteString("\r\n"), maximumFrameLength = 100, allowTruncation = true)
 
   val route: Route = {
     get {
       mapResponseEntity(_.withContentType(`application/json`)) {
         pathPrefix("topic_list") {
           complete {
-            val list = new File(dir).listFiles().filter(_.isDirectory).map(_.getName)
-            TopicsList(list.toList)
+            Future {
+              Option(new File(dir).listFiles()).filter(_.nonEmpty) match {
+                case Some(arr) => Right(TopicsList(arr.filter(_.isDirectory).map(_.getName).toList))
+                case None => Left(Error("No topics"))
+              }
+            }
           }
         } ~
-          (pathPrefix("last_timestamp") & parameter('topicname)) { topicname =>
+        parameter('topicname) { topicname =>
+          path("last_timestamp") {
             complete {
-              LastTimestamp(lastTimestamp(dir, topicname).getName)
-            }
-          } ~
-          (pathPrefix("last_stats") & parameter('topicname)) { topicname =>
-
-            complete {
-              println("last_timestamp_stats")
-              val last = lastTimestamp(dir, topicname)
-              val res = SynchronousFileSource(new File(last.getAbsolutePath + File.separator + "offsets.csv"))
-                .via(Framing.delimiter(ByteString("\r\n"), maximumFrameLength = 100, allowTruncation = true))
-                .map(_.utf8String)
-                .map(_.split(",")(1).toLong)
-                .runWith(Sink.fold(FoldResult(Long.MaxValue, 0, 0, 0)){case (FoldResult(min, max, sum, count), num) =>
-                  FoldResult(
-                    if (min > num) num else min,
-                    if (max < num) num else max,
-                    sum + num,
-                    count + 1
-                  )
-                })
-              res.map(_.toStats)
-            }
-          } ~
-          (pathPrefix("last_run_partition_list") & parameter('topicname)) { topicname =>
-
-            complete {
-              println("last_run_partition_list")
-              val last = lastTimestamp(dir, topicname)
-              val list = Source.fromFile(last.getAbsolutePath + File.separator + "offsets.csv", "UTF-8").getLines()
-                .map{str =>
-                  val arr = str.split(",")
-                  (arr(0), arr(1))
+              (cacheActor ? GetLast(dir, topicname))
+                .map{
+                  case SuccessStamp(stamp) => Right(LastTimestamp(stamp))
+                  case ErrorMsg(msg) => Left(Error(msg))
                 }
-              LastRunPartitionList(list.toList)
+            }
+          } ~
+          path("last_stats") {
+            complete {
+              (cacheActor ? GetLast(dir, topicname)).map{
+                    case SuccessStamp(stamp) => Right(getStats(getCsvName(dir, topicname, stamp)))
+                    case ErrorMsg(msg) => Left(Error(msg))
+                }
+            }
+          } ~
+          path("last_run_partition_list") {
+            complete {
+              (cacheActor ? GetLast(dir, topicname)).map{
+                case SuccessStamp(stamp) => Right(getList(getCsvName(dir, topicname, stamp)))
+                case ErrorMsg(msg) => Left(Error(msg))
+              }
             }
           }
+        }
       }
     }
   }
 
-  def lastTimestamp(dir: String, topicname: String): File = {
-    val file = new File(dir + File.separator + topicname + File.separator + "history")
-    println(file.getAbsolutePath + " " + file.exists())
-    file.listFiles().sortBy(_.getName).last
+  def getList(path: String): Future[LastRunPartitionList] = {
+    SynchronousFileSource(new File(path))
+      .via(framing)
+      .map(_.utf8String)
+      .map{str =>
+      val arr = str.split(",")
+      (arr(0), arr(1))
+    }.runWith(Sink.fold(List.empty[(String, String)]){case (list, tuple) => list :+ tuple})
+      .map(LastRunPartitionList)
   }
 
-  /*def g(in: akka.stream.scaladsl.Source[Long, Long]) = Flow() { implicit b =>
-    import FlowGraph.Implicits._
+  def getStats(path: String): Future[LastTimestampStats] = {
+    SynchronousFileSource(new File(path))
+      .via(framing)
+      .map(_.utf8String)
+      .map(_.split(",")(1).toLong)
+      .runWith(Sink.fold(FoldResult(Long.MaxValue, 0, 0, 0)){
+      case (FoldResult(min, max, sum, count), num) =>
+        FoldResult(
+          if (min > num) num else min,
+          if (max < num) num else max,
+          //если подразумевается, что сумма может выйти за рамки Long, то можно взять бОльший тип или считать среднее
+          //как x1/n + x2/n + ... , где n - число строк в файле
+          sum + num,
+          count + 1
+        )
+    }).map(_.toStats)
+  }
 
-    val out = Sink.head[Long]
-
-    val bcast = b.add(Broadcast[Long](4))
-    val merge = b.add(Merge[Long](4))
-
-    val flowMax = Flow[Long].fold[Long](0)((x, y) => if (x > y) x else y)
-    val flowMin = Flow[Long].fold[Long](0)((x, y) => if (x < y) x else y)
-    val flowSum = Flow[Long].fold[Long](0)(_ + _)
-    val flowCount = Flow[Long].fold[Long](0)((r,c) => r + 1)
-
-    in ~> bcast ~> flowMax ~> merge ~> out
-          bcast ~> flowMin   ~> merge
-          bcast ~> flowSum   ~> merge
-          bcast ~> flowCount ~> merge
-  }*/
-
+  def getCsvName(dir: String, topicname: String, stamp: String) = dir + File.separator + topicname + File.separator + "history" + File.separator + stamp + File.separator + "offsets.csv"
 
   val serverBinding = Http(system).bindAndHandle(interface = host, port = port, handler = route).onSuccess {
     case _ => log.info(s"akka-http server started on $host:$port")
   }
-}
-
-object Testing extends App {
-  implicit val system = ActorSystem("test-system", ConfigFactory.parseString( """
-                                                                                |akka {
-                                                                                |  loggers = ["akka.event.Logging$DefaultLogger"]
-                                                                                |  loglevel = "DEBUG"
-                                                                                |}
-                                                                              """.stripMargin))
-  new HttpFrontend("C:\\Users\\diemust\\Documents\\GitHub\\partition-counter\\src\\test\\resources\\test_dir")
 }

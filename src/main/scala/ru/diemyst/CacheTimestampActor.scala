@@ -68,7 +68,7 @@ class CacheTimestampActor(var cachedDirs: Map[String, (String, Long)]) extends A
 }
 
 object CacheTimestampActor {
-  def props = Props(classOf[CacheTimestampActor], Map.empty[String, (String, Long)]).withDispatcher("custom-thread-pool-dispatcher")
+  def props: Props = Props(classOf[CacheTimestampActor], Map.empty[String, (String, Long)]).withDispatcher("custom-thread-pool-dispatcher")
 }
 
 class ResponseMessage
